@@ -276,10 +276,10 @@ struct instruction
 	std::string to_string() const
 	{
 		std::stringstream ss;
-		ss << std::hex << this->offset << ": " << this->mnemonics << " ";
+		ss << this->mnemonics;
 		if (this->operand && this->operand_length > 0)
 		{
-			ss << "0x" << std::setfill('0') << std::setw((std::streamsize)this->operand_length << 1) << this->operand;
+			ss << " 0x" << std::setfill('0') << std::setw((std::streamsize)this->operand_length << 1) << this->operand;
 		}
 		return ss.str();
 	};

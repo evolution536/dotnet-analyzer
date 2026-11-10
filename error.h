@@ -15,6 +15,7 @@ enum class error_codes
 	decoded_index_invalid_table,
 	invalid_method_header,
 	invalid_method_rva,
+	metadata_stream_missing,
 };
 
 // Gets friendly representation of error message.

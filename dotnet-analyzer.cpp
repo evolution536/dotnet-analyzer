@@ -142,6 +142,8 @@ bool dotnet_analyzer::run()
 	else
 	{
 		this->last_error_code = error_codes::invalid_image_type;
+		delete this->result;
+		this->result = NULL;
 		return false;
 	}
 
@@ -150,6 +152,8 @@ bool dotnet_analyzer::run()
 	if (cor20_size != 0x48)
 	{
 		this->last_error_code = error_codes::invalid_cli_header;
+		delete this->result;
+		this->result = NULL;
 		return false;
 	}
 
@@ -158,6 +162,8 @@ bool dotnet_analyzer::run()
 	if (!cor20_rva || !cor20_size)
 	{
 		this->last_error_code = error_codes::invalid_cli_header;
+		delete this->result;
+		this->result = NULL;
 		return false;
 	}
 
@@ -165,6 +171,8 @@ bool dotnet_analyzer::run()
 	if (cor20_rva > this->buffer_len || cor20_size > this->buffer_len || cor20_rva + cor20_size > this->buffer_len)
 	{
 		this->last_error_code = error_codes::invalid_cli_header;
+		delete this->result;
+		this->result = NULL;
 		return false;
 	}
 
@@ -182,6 +190,8 @@ bool dotnet_analyzer::run()
 	if (metadata_rva > this->buffer_len || metadata_size > this->buffer_len || metadata_rva + metadata_size > this->buffer_len)
 	{
 		this->last_error_code = error_codes::invalid_metadata_directory;
+		delete this->result;
+		this->result = NULL;
 		return false;
 	}
 
@@ -191,6 +201,8 @@ bool dotnet_analyzer::run()
 	if (*(uint32_t*)metadata_ptr != 0x424A5342)
 	{
 		this->last_error_code = error_codes::invalid_metadata_directory;
+		delete this->result;
+		this->result = NULL;
 		return false;
 	}
 
@@ -207,6 +219,8 @@ bool dotnet_analyzer::run()
 	if (metadata_ptr > this->buffer + this->buffer_len)
 	{
 		this->last_error_code = error_codes::invalid_metadata_directory;
+		delete this->result;
+		this->result = NULL;
 		return false;
 	}
 
@@ -226,6 +240,8 @@ bool dotnet_analyzer::run()
 		if (stream_ptr > this->buffer + this->buffer_len || stream_ptr + stream_size > this->buffer + this->buffer_len)
 		{
 			this->last_error_code = error_codes::invalid_stream_header;
+			delete this->result;
+			this->result = NULL;
 			return false;
 		}
 
@@ -248,6 +264,8 @@ bool dotnet_analyzer::run()
 		if ((uint32_t)(metadata_ptr - this->buffer) + name_length > this->buffer_len)
 		{
 			this->last_error_code = error_codes::invalid_stream_header;
+			delete this->result;
+			this->result = NULL;
 			return false;
 		}
 
@@ -258,6 +276,15 @@ bool dotnet_analyzer::run()
 		// Increment the pointer to the next header.
 		metadata_ptr += num_dwords_passed * sizeof(uint32_t);
 		stream_iter++;
+	}
+
+	// Test whether we have the '~' stream. This will be used to parse metadata from. If we do not have this stream, we cannot continue our analysis.
+	if (!this->result->dotnet_streams.count("#~"))
+	{
+		this->last_error_code = error_codes::metadata_stream_missing;
+		delete this->result;
+		this->result = NULL;
+		return false;
 	}
 
 	return true;
@@ -276,9 +303,9 @@ static bool parse_command_line_arguments(int argc, char** argv, std::map<std::st
 		{
 			arguments["help"] = "true";
 		}
-		else if (cur.compare("-v") == 0 || cur.compare("--verbose") == 0)
+		else if (cur.compare("-a") == 0 || cur.compare("--analysis") == 0)
 		{
-			arguments["verbose"] = "true";
+			arguments["analysis"] = "true";
 		}
 		else if (cur.compare("-d") == 0 || cur.compare("--dump-streams") == 0)
 		{
@@ -291,6 +318,10 @@ static bool parse_command_line_arguments(int argc, char** argv, std::map<std::st
 		else if (cur.compare("-u") == 0 || cur.compare("--format-unicode") == 0)
 		{
 			arguments["format_unicode"] = "true";
+		}
+		else if (cur.compare("-i") == 0 || cur.compare("--disassembly") == 0)
+		{
+			arguments["disassembly"] = "true";
 		}
 		else if ((cur.compare("-f") == 0 || cur.compare("--input-file") == 0) && i < argc)
 		{
@@ -312,11 +343,13 @@ static void print_help()
 	std::cout << "Usage: dotnet-analyzer -f <input_file [options]" << std::endl << std::endl;
 	std::cout << "Basic parameters:" << std::endl;
 	std::cout << "-h,--help\t\tRequests this help menu." << std::endl;
-	std::cout << "-v,--verbose\t\tEnables verbose output." << std::endl;
 	std::cout << "-f,--input-file\t\tSpecifies the input binary file." << std::endl;
 	std::cout << std::endl << "Output parameters:" << std::endl;
+	std::cout << "-a,--analysis\t\tOutputs entire analysis (enables all output parameters)." << std::endl;
 	std::cout << "-d,--dump-streams\tDumps the contents of detected .NET streams." << std::endl;
 	std::cout << "-m,--metadata-tokens\tDumps machine-readable list of metadata tokens in the tables." << std::endl;
+	std::cout << "-u,--format-unicode\tEncodes UTF-16 strings as ASCII (only for single-byte characters)." << std::endl;
+	std::cout << "-i,--disassembly\tDumps disassembly of bytecode instructions with methods." << std::endl;
 }
 
 int main(int argc, char** argv)
@@ -325,7 +358,7 @@ int main(int argc, char** argv)
 	std::map<std::string, std::string> args;
 	if (!parse_command_line_arguments(argc, argv, args))
 	{
-		std::cout << "ERROR: Parsing command line arguments failed!" << std::endl;
+		std::cerr << "ERROR: Parsing command line arguments failed!" << std::endl;
 		return 1;
 	}
 
@@ -337,21 +370,24 @@ int main(int argc, char** argv)
 	}
 
 	// Check whether verbose mode is requested.
-	const bool verbose = !!args.count("verbose");
+	const bool output_analysis = !!args.count("analysis");
 
 	// Check whether the contents of detected streams should be dumped.
-	const bool dump_streams = !!args.count("dump_streams");
+	const bool dump_streams = !!args.count("dump_streams") || output_analysis;
 
 	// Check whether Unicode strings should be formatted as readable, the poor-mans way.
-	const bool format_unicode = !!args.count("format_unicode");
+	const bool format_unicode = !!args.count("format_unicode") || output_analysis;
 
 	// Check whether the dumping of referenced metadata tokens is requested.
-	const bool dump_metadata_tokens = !!args.count("dump_metadata_tokens");
+	const bool dump_metadata_tokens = !!args.count("dump_metadata_tokens") || output_analysis;
+
+	// Check whether the disassembly is requested. If so, methods will be dumped in the analysis automatically.
+	const bool dump_disassembly = !!args.count("disassembly") || output_analysis;
 
 	// Check whether the input file has been specified.
 	if (!args.count("input_file"))
 	{
-		std::cout << "ERROR: Please specify the input file using the -f switch!" << std::endl;
+		std::cerr << "ERROR: Please specify the input file using the -f switch!" << std::endl;
 		return 1;
 	}
 
@@ -361,7 +397,7 @@ int main(int argc, char** argv)
 	// Test whether the file is open for reading.
 	if (!input_file.is_open())
 	{
-		std::cout << "ERROR: Failed to open the input file!" << std::endl;
+		std::cerr << "ERROR: Failed to open the input file!" << std::endl;
 		return 1;
 	}
 
@@ -370,71 +406,69 @@ int main(int argc, char** argv)
 
 	// Start .NET analysis.
 	dotnet_analyzer analyzer(&buffer[0], (uint32_t)buffer.size());
-	const bool result = analyzer.run();
+	const bool success = analyzer.run();
 	nlohmann::json output_json;
-	if (result)
+	if (!success)
 	{
-		// Analysis completed without errors.
-		output_json["status"] = "ok";
+		auto err = analyzer.get_last_error();
+		output_json["status"] = "error";
+		output_json["message"] = get_error_code_message(err);
+		output_json["error_code"] = err;
+		std::cout << output_json.dump(4) << std::endl;
+		return 0;
+	}
 
-		// Retrieve the analysis result.
-		analysis_result* const result = analyzer.get_analysis_result();
-		if (!result)
+	// Retrieve the analysis result.
+	analysis_result* const result = analyzer.get_analysis_result();
+
+	// Start parsing the .NET metadata. The second stage in the analysis, and it has to succeed for us to continue.
+	const std::vector<uint8_t>& tilde_stream = result->dotnet_streams["#~"];
+	metadata_parser parser(&tilde_stream[0], (uint32_t)tilde_stream.size());
+	if (!parser.parse(result))
+	{
+		auto err = analyzer.get_last_error();
+		output_json["status"] = "error";
+		output_json["message"] = get_error_code_message(err);
+		output_json["error_code"] = err;
+		std::cout << output_json.dump(4) << std::endl;
+		return 0;
+	}
+
+	// Still here, analysis completed without errors.
+	output_json["status"] = "ok";
+	output_json["image_size"] = result->image_size;
+
+	// If requested, output the basic version parameters to JSON.
+	if (output_analysis)
+	{
+		output_json["analysis"]["runtime_version"] = std::to_string(result->general_properties.major_runtime_version) + "." + std::to_string(result->general_properties.minor_runtime_version);
+		output_json["analysis"]["metadata_version"] = std::to_string(result->general_properties.metadata_major_version) + "." + std::to_string(result->general_properties.metadata_minor_version);
+	}
+
+	// Display metadata results in verbose mode.
+	if (output_analysis)
+	{
+		nlohmann::json metadata_tables;
+		for (auto const& table : result->metadata_tables)
 		{
-			std::cerr << "ERROR: Analysis result is NULL!" << std::endl;
-			return 1;
+			const char* table_name = get_metadata_table_name(table.first);
+			nlohmann::json table_obj;
+			table_obj["index"] = table.first;
+			table_obj["name"] = table_name ? table_name : "";
+			table_obj["num_rows"] = table.second;
+			metadata_tables.push_back(table_obj);
 		}
+		output_json["analysis"]["metadata_tables"] = metadata_tables;
+	}
 
-		// Print general properties of the binary in verbose mode.
-		if (verbose)
+	// Do the contents of detected streams have to dumped?
+	nlohmann::json streams_obj;
+	if (dump_streams)
+	{
+		// Dump the #Strings stream first.
+		std::map<uint32_t, std::string> dumped_strings;
+		if (dump_strings_stream(result, dumped_strings))
 		{
-			std::cout << "INFO: Runtime version: " << std::to_string(result->general_properties.major_runtime_version) + "." + std::to_string(result->general_properties.minor_runtime_version) << std::endl;
-			std::cout << "INFO: Metadata version: " << std::to_string(result->general_properties.metadata_major_version) + "." + std::to_string(result->general_properties.metadata_minor_version) << std::endl;
-			for (auto const& stream : result->dotnet_streams)
-			{
-				std::cout << "INFO: Found .NET stream: " << stream.first << ", size: " << stream.second.size() << std::endl;
-			}
-		}
-
-		// Test whether we have the '~' stream. This will be used to parse metadata from.
-		if (!result->dotnet_streams.count("#~"))
-		{
-			std::cout << "ERROR: No metadata stream (#~) was detected in the binary!" << std::endl;
-			return 1;
-		}
-
-		// Start parsing the .NET metadata.
-		const std::vector<uint8_t>& tilde_stream = result->dotnet_streams["#~"];
-		metadata_parser parser(&tilde_stream[0], (uint32_t)tilde_stream.size());
-		if (!parser.parse(result))
-		{
-			// Get last error code and print friendly message.
-			auto err = parser.get_last_error();
-			std::cout << "ERROR: Last error code: " << (int)err << " (" << get_error_code_message(err) << ")" << std::endl;
-			return 1;
-		}
-
-		// Display metadata results in verbose mode.
-		if (verbose)
-		{
-			for (auto const& table : result->metadata_tables)
-			{
-				const char* table_name = get_metadata_table_name(table.first);
-				std::cout << "INFO: Detected metadata table: " << table.first << " (" << (table_name ? table_name : "") << ") having " << table.second << " rows." << std::endl;
-			}
-		}
-
-		// Do the contents of detected streams have to dumped?
-		nlohmann::json streams_obj;
-		if (dump_streams)
-		{
-			// Dump the #Strings stream first.
-			std::map<uint32_t, std::string> dumped_strings;
-			if (!dump_strings_stream(result, dumped_strings))
-			{
-				std::cout << "WARNING: #Strings stream was not detected!" << std::endl;
-			}
-
 			// Print the strings.
 			nlohmann::json strings_stream;
 			for (auto const& str : dumped_strings)
@@ -446,14 +480,12 @@ int main(int argc, char** argv)
 				strings_stream.push_back(string_obj);
 			}
 			streams_obj["#Strings"] = strings_stream;
+		}
 
-			// Dump the #US stream next.
-			std::map<uint32_t, std::string> dumped_unicode_strings;
-			if (!dump_unicode_strings_stream(result, dumped_unicode_strings))
-			{
-				std::cout << "WARNING: #US stream was not detected or contains invalid data!" << std::endl;
-			}
-
+		// Dump the #US stream next.
+		std::map<uint32_t, std::string> dumped_unicode_strings;
+		if (dump_unicode_strings_stream(result, dumped_unicode_strings))
+		{
 			// Send the strings to the output JSON.
 			nlohmann::json us_stream;
 			for (auto const& str : dumped_unicode_strings)
@@ -474,14 +506,12 @@ int main(int argc, char** argv)
 				us_stream.push_back(string_obj);
 			}
 			streams_obj["#US"] = us_stream;
+		}
 
-			// Dump the #Blob stream as well.
-			std::map<uint32_t, std::string> dumped_blobs;
-			if (!dump_blob_stream(result, dumped_blobs))
-			{
-				std::cout << "WARNING: #Blob stream was not detected or contains invalid data!" << std::endl;
-			}
-
+		// Dump the #Blob stream as well.
+		std::map<uint32_t, std::string> dumped_blobs;
+		if (dump_blob_stream(result, dumped_blobs))
+		{
 			// Print the blobs.
 			nlohmann::json blobs_stream;
 			for (auto const& blob : dumped_blobs)
@@ -492,109 +522,95 @@ int main(int argc, char** argv)
 				blobs_stream.push_back(blob_obj);
 			}
 			streams_obj["#Blob"] = blobs_stream;
-			output_json["streams"] = streams_obj;
+			output_json["analysis"]["streams"] = streams_obj;
 		}
-
-		if (dump_metadata_tokens)
-		{
-			// Output JSON with relevant information.
-			nlohmann::json metadata_tokens_json;
-
-			// Dump the TypeRef tokens and their full name when resolved.
-			nlohmann::json typerefs_json;
-			for (uint32_t i = 0; i < result->typerefs.size(); ++i)
-			{
-				// Construct full name of token after it has been resolved.
-				std::string full_name;
-				if (!result->typerefs[i].namespace_name.empty())
-				{
-					full_name = result->typerefs[i].namespace_name + ".";
-				}
-				full_name += result->typerefs[i].type_name;
-
-				// Create output object.
-				nlohmann::json typerefs_obj;
-				typerefs_obj["token"] = get_metadata_token_string((METADATA_TABLE_TYPE_REF << 24) | (i + 1));
-				typerefs_obj["full_name"] = full_name;
-				typerefs_json.push_back(typerefs_obj);
-			}
-			metadata_tokens_json["TypeRefs"] = typerefs_json;
-
-			// Dump the TypeDef tokens and their full name when resolved.
-			nlohmann::json typedefs_json;
-			for (uint32_t i = 0; i < result->typedefs.size(); ++i)
-			{
-				std::string full_name;
-				if (!result->typedefs[i].namespace_name.empty())
-				{
-					full_name = result->typedefs[i].namespace_name + ".";
-				}
-				full_name += result->typedefs[i].type_name;
-
-				// Create output object.
-				nlohmann::json typedefs_obj;
-				typedefs_obj["token"] = get_metadata_token_string((METADATA_TABLE_TYPE_DEF << 24) | (i + 1));
-				typedefs_obj["full_name"] = full_name;
-				typedefs_json.push_back(typedefs_obj);
-			}
-			metadata_tokens_json["TypeDefs"] = typedefs_json;
-
-			nlohmann::json methods_json;
-			for (uint32_t i = 0; i < result->methods.size(); ++i)
-			{
-				nlohmann::json methods_obj;
-				methods_obj["token"] = get_metadata_token_string((METADATA_TABLE_METHOD_DEF << 24) | (i + 1));
-				methods_obj["full_name"] = result->methods[i].name;
-				methods_json.push_back(methods_obj);
-			}
-			metadata_tokens_json["Methods"] = methods_json;
-
-			// Track metadata information in the output.
-			output_json["metadata"] = metadata_tokens_json;
-		}
-
-		// Dump metadata structure in verbose mode.
-		if (verbose)
-		{
-			// The module information first.
-			std::cout << "INFO: ----------------------------------------------------" << std::endl;
-			std::cout << "INFO: Module name: " << string_escape_unreadable(result->module.name) << std::endl;
-
-			// Print defined type names.
-			std::cout << "INFO: ----------------------------------------------------" << std::endl;
-			for (const type_def& ref : result->typedefs)
-			{
-				std::cout << "INFO: Found defined type: " << string_escape_unreadable(ref.to_string()) << std::endl;
-			}
-
-			// Print referenced type names.
-			std::cout << "INFO: ----------------------------------------------------" << std::endl;
-			for (const typeref& ref : result->typerefs)
-			{
-				std::cout << "INFO: Found referenced type: " << string_escape_unreadable(ref.to_string()) << std::endl;
-			}
-
-			std::cout << "INFO: ----------------------------------------------------" << std::endl;
-			for (const method& m : result->methods)
-			{
-				std::cout << "INFO: Found method: " << string_escape_unreadable(m.to_string()) << std::endl;
-				if (m.disassembly.empty()) continue;
-				std::cout << "Disassembly:" << std::endl;
-				for (auto& insn : m.disassembly)
-				{
-					std::cout << insn.to_string() << std::endl;
-				}
-			}
-		}
+// FIXME: Dump other streams as well; and stream sizes?
 	}
-	else
+
+	if (dump_metadata_tokens)
 	{
-		// Get last error code and print friendly message.
-		auto err = analyzer.get_last_error();
-		std::cout << "ERROR: Analysis failed! Last error code: " << (int)err << " (" << get_error_code_message(err) << ")" << std::endl;
-		output_json["status"] = "error";
-		output_json["message"] = get_error_code_message(err);
-		output_json["error_code"] = err;
+		// Output JSON with relevant information.
+		nlohmann::json metadata_tokens_json;
+
+		// Dump the TypeRef tokens and their full name when resolved.
+		nlohmann::json typerefs_json;
+		for (uint32_t i = 0; i < result->typerefs.size(); ++i)
+		{
+			// Construct full name of token after it has been resolved.
+			std::string full_name;
+			if (!result->typerefs[i].namespace_name.empty())
+			{
+				full_name = result->typerefs[i].namespace_name + ".";
+			}
+			full_name += result->typerefs[i].type_name;
+
+			// Create output object.
+			nlohmann::json typerefs_obj;
+			typerefs_obj["token"] = get_metadata_token_string((METADATA_TABLE_TYPE_REF << 24) | (i + 1));
+			typerefs_obj["full_name"] = full_name;
+			typerefs_json.push_back(typerefs_obj);
+		}
+		metadata_tokens_json["TypeRefs"] = typerefs_json;
+
+		// Dump the TypeDef tokens and their full name when resolved.
+		nlohmann::json typedefs_json;
+		for (uint32_t i = 0; i < result->typedefs.size(); ++i)
+		{
+			std::string full_name;
+			if (!result->typedefs[i].namespace_name.empty())
+			{
+				full_name = result->typedefs[i].namespace_name + ".";
+			}
+			full_name += result->typedefs[i].type_name;
+
+			// Create output object.
+			nlohmann::json typedefs_obj;
+			typedefs_obj["token"] = get_metadata_token_string((METADATA_TABLE_TYPE_DEF << 24) | (i + 1));
+			typedefs_obj["full_name"] = full_name;
+			typedefs_json.push_back(typedefs_obj);
+		}
+		metadata_tokens_json["TypeDefs"] = typedefs_json;
+
+		nlohmann::json methods_json;
+		for (uint32_t i = 0; i < result->methods.size(); ++i)
+		{
+			// Output basic method information first.
+			nlohmann::json methods_obj;
+			methods_obj["token"] = get_metadata_token_string((METADATA_TABLE_METHOD_DEF << 24) | (i + 1));
+			methods_obj["full_name"] = result->methods[i].name;
+			methods_obj["size"] = result->methods[i].length;
+			methods_obj["rva"] = result->methods[i].rva;
+
+			// Output disassembly and detailed method information if requested.
+			if (dump_disassembly)
+			{
+				nlohmann::json disasm_json;
+				if (!result->methods[i].disassembly.empty())
+				{
+					for (auto& insn : result->methods[i].disassembly)
+					{
+						nlohmann::json insn_obj;
+						insn_obj["offset"] = insn.offset;
+						insn_obj["instruction"] = insn.to_string();
+						insn_obj["length"] = insn.insn_length;
+						disasm_json.push_back(insn_obj);
+					}
+					methods_obj["disassembly"] = disasm_json;
+				}
+			}
+			methods_json.push_back(methods_obj);
+		}
+		metadata_tokens_json["Methods"] = methods_json;
+
+		// Track metadata information in the output.
+		output_json["analysis"]["metadata"] = metadata_tokens_json;
+	}
+
+	// Dump additional metadata when requested.
+	if (output_analysis)
+	{
+		// Output the module information under metadata.
+		output_json["analysis"]["module"]["name"] = string_escape_unreadable(result->module.name);
 	}
 
 	// Finally, print the output JSON.

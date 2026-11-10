@@ -4,9 +4,6 @@
 #include <string>
 #include "analysis-result.h"
 
-// FIXME: esscap string funct
-
-
 // Dumps the entire #Strings stream, which contains null-terminated, ASCII strings.
 bool dump_strings_stream(const analysis_result* result, std::map<uint32_t, std::string>& dumped_strings);
 

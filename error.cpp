@@ -30,6 +30,8 @@ const char* get_error_code_message(const error_codes err)
 			return "Method header has invalid type";
 		case error_codes::invalid_method_rva:
 			return "Method RVA is invalid";
+		case error_codes::metadata_stream_missing:
+			return "Metadata (~) stream missing";
 		default:
 			return NULL;
 	}
