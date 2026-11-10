@@ -1,5 +1,6 @@
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <vector>
 #include <map>
 #include <iomanip>
@@ -43,6 +44,14 @@ uint32_t rva_to_file_offset(analysis_result* const result, const uint32_t rva)
 	}
 
 	return 0;
+}
+
+// Converts metadata token, which is a 32-bit unsigned integer, to a string reresentation.
+static std::string get_metadata_token_string(const uint32_t token)
+{
+	std::stringstream ss;
+	ss << "0x" << std::setfill('0') << std::setw(8) << std::hex << token;
+	return ss.str();
 }
 
 // ------------------------------------------------------------------------
@@ -339,13 +348,6 @@ int main(int argc, char** argv)
 	// Check whether the dumping of referenced metadata tokens is requested.
 	const bool dump_metadata_tokens = !!args.count("dump_metadata_tokens");
 
-	// Some operations are mutually exclusive.
-	if (dump_streams && dump_metadata_tokens)
-	{
-		std::cout << "ERROR: The -d and -m switches are mutually exclusive!" << std::endl;
-		return 1;
-	}
-
 	// Check whether the input file has been specified.
 	if (!args.count("input_file"))
 	{
@@ -369,13 +371,17 @@ int main(int argc, char** argv)
 	// Start .NET analysis.
 	dotnet_analyzer analyzer(&buffer[0], (uint32_t)buffer.size());
 	const bool result = analyzer.run();
+	nlohmann::json output_json;
 	if (result)
 	{
+		// Analysis completed without errors.
+		output_json["status"] = "ok";
+
 		// Retrieve the analysis result.
 		analysis_result* const result = analyzer.get_analysis_result();
 		if (!result)
 		{
-			std::cout << "ERROR: Analysis result is NULL!" << std::endl;
+			std::cerr << "ERROR: Analysis result is NULL!" << std::endl;
 			return 1;
 		}
 
@@ -419,6 +425,7 @@ int main(int argc, char** argv)
 		}
 
 		// Do the contents of detected streams have to dumped?
+		nlohmann::json streams_obj;
 		if (dump_streams)
 		{
 			// Dump the #Strings stream first.
@@ -429,10 +436,16 @@ int main(int argc, char** argv)
 			}
 
 			// Print the strings.
+			nlohmann::json strings_stream;
 			for (auto const& str : dumped_strings)
 			{
-				std::cout << "INFO: #Strings offset: " << str.first << " --> " << string_escape_unreadable(str.second) << std::endl;
+				// Create object for current string and push it to the strings stream array.
+				nlohmann::json string_obj;
+				string_obj["offset"] = str.first;
+				string_obj["value"] = str.second;
+				strings_stream.push_back(string_obj);
 			}
+			streams_obj["#Strings"] = strings_stream;
 
 			// Dump the #US stream next.
 			std::map<uint32_t, std::string> dumped_unicode_strings;
@@ -441,19 +454,26 @@ int main(int argc, char** argv)
 				std::cout << "WARNING: #US stream was not detected or contains invalid data!" << std::endl;
 			}
 
-			// Print the strings.
+			// Send the strings to the output JSON.
+			nlohmann::json us_stream;
 			for (auto const& str : dumped_unicode_strings)
 			{
+				nlohmann::json string_obj;
+				string_obj["offset"] = str.first;
+
 				if (format_unicode)
 				{
-
-					std::cout << "INFO: #US offset: " << str.first << " --> " << get_poor_mans_utf16_string((uint8_t*)str.second.c_str(), (uint32_t)str.second.size()) << std::endl;
+					string_obj["value"] = get_poor_mans_utf16_string((uint8_t*)str.second.c_str(), (uint32_t)str.second.size());
 				}
 				else
 				{
-					std::cout << "INFO: #US offset: " << str.first << " --> " << string_escape_unreadable(str.second) << std::endl;
+					string_obj["value"] = string_escape_unreadable(str.second);
 				}
+
+				// Track this string in the output, however encoded.
+				us_stream.push_back(string_obj);
 			}
+			streams_obj["#US"] = us_stream;
 
 			// Dump the #Blob stream as well.
 			std::map<uint32_t, std::string> dumped_blobs;
@@ -463,46 +483,74 @@ int main(int argc, char** argv)
 			}
 
 			// Print the blobs.
+			nlohmann::json blobs_stream;
 			for (auto const& blob : dumped_blobs)
 			{
-				std::cout << "INFO: #Blob offset: " << blob.first << " --> " << string_escape_unreadable(blob.second) << std::endl;
+				nlohmann::json blob_obj;
+				blob_obj["offset"] = blob.first;
+				blob_obj["value"] = string_escape_unreadable(blob.second);
+				blobs_stream.push_back(blob_obj);
 			}
+			streams_obj["#Blob"] = blobs_stream;
+			output_json["streams"] = streams_obj;
 		}
-		else if (dump_metadata_tokens)
-		{
-			// Output CSV header with relevant information.
-			std::cout << "token,name,type" << std::endl;
 
-			// Dump the tokens for relevant metadata information parsed from the binary.
+		if (dump_metadata_tokens)
+		{
+			// Output JSON with relevant information.
+			nlohmann::json metadata_tokens_json;
+
+			// Dump the TypeRef tokens and their full name when resolved.
+			nlohmann::json typerefs_json;
 			for (uint32_t i = 0; i < result->typerefs.size(); ++i)
 			{
-				const uint32_t token = (METADATA_TABLE_TYPE_REF << 24) | (i + 1);
+				// Construct full name of token after it has been resolved.
 				std::string full_name;
 				if (!result->typerefs[i].namespace_name.empty())
 				{
 					full_name = result->typerefs[i].namespace_name + ".";
 				}
 				full_name += result->typerefs[i].type_name;
-				std::cout << "0x" << std::setfill('0') << std::setw(8) << std::hex << token << std::dec << "," << full_name << ",TypeRef" << std::endl;
-			}
 
+				// Create output object.
+				nlohmann::json typerefs_obj;
+				typerefs_obj["token"] = get_metadata_token_string((METADATA_TABLE_TYPE_REF << 24) | (i + 1));
+				typerefs_obj["full_name"] = full_name;
+				typerefs_json.push_back(typerefs_obj);
+			}
+			metadata_tokens_json["TypeRefs"] = typerefs_json;
+
+			// Dump the TypeDef tokens and their full name when resolved.
+			nlohmann::json typedefs_json;
 			for (uint32_t i = 0; i < result->typedefs.size(); ++i)
 			{
-				const uint32_t token = (METADATA_TABLE_TYPE_DEF << 24) | (i + 1);
 				std::string full_name;
 				if (!result->typedefs[i].namespace_name.empty())
 				{
 					full_name = result->typedefs[i].namespace_name + ".";
 				}
 				full_name += result->typedefs[i].type_name;
-				std::cout << "0x" << std::setfill('0') << std::setw(8) << std::hex << token << std::dec << "," << full_name << ",TypeDef" << std::endl;
-			}
 
+				// Create output object.
+				nlohmann::json typedefs_obj;
+				typedefs_obj["token"] = get_metadata_token_string((METADATA_TABLE_TYPE_DEF << 24) | (i + 1));
+				typedefs_obj["full_name"] = full_name;
+				typedefs_json.push_back(typedefs_obj);
+			}
+			metadata_tokens_json["TypeDefs"] = typedefs_json;
+
+			nlohmann::json methods_json;
 			for (uint32_t i = 0; i < result->methods.size(); ++i)
 			{
-				const uint32_t token = (METADATA_TABLE_METHOD_DEF << 24) | (i + 1);
-				std::cout << "0x" << std::setfill('0') << std::setw(8) << std::hex << token << std::dec << "," << result->methods[i].name << ",Method" << std::endl;
+				nlohmann::json methods_obj;
+				methods_obj["token"] = get_metadata_token_string((METADATA_TABLE_METHOD_DEF << 24) | (i + 1));
+				methods_obj["full_name"] = result->methods[i].name;
+				methods_json.push_back(methods_obj);
 			}
+			metadata_tokens_json["Methods"] = methods_json;
+
+			// Track metadata information in the output.
+			output_json["metadata"] = metadata_tokens_json;
 		}
 
 		// Dump metadata structure in verbose mode.
@@ -544,7 +592,12 @@ int main(int argc, char** argv)
 		// Get last error code and print friendly message.
 		auto err = analyzer.get_last_error();
 		std::cout << "ERROR: Analysis failed! Last error code: " << (int)err << " (" << get_error_code_message(err) << ")" << std::endl;
+		output_json["status"] = "error";
+		output_json["message"] = get_error_code_message(err);
+		output_json["error_code"] = err;
 	}
 
+	// Finally, print the output JSON.
+	std::cout << output_json.dump(4) << std::endl;
 	return 0;
 }
