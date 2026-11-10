@@ -1,6 +1,6 @@
 [submodule "json"]
 	path = json
-	url = https://github.com/nlohmann/json.git
+	url = https://github.com/nlohmann/json
 [submodule "libreverse"]
 	path = libreverse
 	url = git@github.com:evolution536/libreverse.git
